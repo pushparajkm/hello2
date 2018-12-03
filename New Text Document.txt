@@ -1,0 +1,1407 @@
+// qdt.cpp : Definiert den Einstiegspunkt für die Konsolenanwendung.
+
+#define _USE_MATH_DEFINES
+#include "stdafx.h"
+
+// multithreading, time, type casting, flow control, ...
+#include <boost/thread/thread.hpp>
+#include <boost/date_time/posix_time/posix_time.hpp>
+#include <boost/lexical_cast.hpp>
+#include <boost/thread/mutex.hpp>
+#include <boost/filesystem.hpp>
+
+// user interface
+#include <curses.h>
+
+// general includes
+#include <stdio.h>
+#include <string>
+
+// classes for qdt
+#include "LttRealtime.h"
+#include "LTT24.h"
+#include "Demodulator.h"
+#include "dataWriter.h"
+#include "Filter.h"
+#include "Global.h"
+#include "Server.h"
+#include "ToolBox.h"
+
+
+
+// disable 'unsafe' warning 4996
+#pragma warning( disable : 4996 )
+
+// variables for program control and information
+boost::mutex io_mutex;									// locks access to all public elements
+// class for global variables
+Global global;
+
+// result of demodulation
+Eigen::MatrixXcd demoResult;
+
+// maximum number of characters for measurement name and comment
+const int string_limit = 147;
+
+// allocate enough memory for those strings
+char measurementNameUI[string_limit] = "[Default Text]";
+char commentUI[string_limit] = "[Default Text]";
+char choices_0[string_limit] = "[Start]";
+char choices_1[string_limit] = "[Stop]";
+char choices_2[string_limit] = "[Clear Clipping]";
+char choices_3[string_limit] = "[Programm beenden]";
+// pressable buttons
+char *choices[] = { 
+	choices_0,
+	choices_1,
+	choices_2,
+	choices_3,
+	measurementNameUI,
+	commentUI
+	};
+// button coordinates
+int x_choices[] = { 5, 19, 34, 58, 12, 12 };
+int y_choices[] = { 17, 17, 17, 17, 19, 20 };
+// total number of choices
+const int n_choices = sizeof(choices) / sizeof(char *);
+
+// methods
+void Highlight_Choices(WINDOW *menu_win, int highlight);
+void changeText(WINDOW *menu_win, int choice);
+void init_Screen(WINDOW *menu_win);
+void default_screen_elements(WINDOW *menu_win);
+std::string dateWithLeadingZeros();
+std::string addLeadingZeros(int value, int maxNumberOfDigits);
+void read_Input(int &highlight);
+void update_Interface(WINDOW *menu_win);
+void update_Status(WINDOW *menu_win);
+void update_Level(WINDOW *menu_win);
+void update_fRef(WINDOW *menu_win, std::vector<int> channelID, std::vector<bool> isRef, Eigen::VectorXd fRefs);
+void reset_fRef(WINDOW *menu_win);
+void reset_Clipping(WINDOW *menu_win);
+void check_clipping(WINDOW *menu_win, std::vector<int> channelID, Eigen::Ref<LttRealtime::MeasMatrix> &data, std::vector<int> &max_Ampl);
+void measurement();
+void calcFRef();
+void evaluateSignals(Eigen::VectorXd time, LttRealtime::MeasMatrix refData, LttRealtime::MeasMatrix signalData,
+	LTT24 ltt, int RefNo, Eigen::VectorXd fRefs, std::vector<Gaussian> gauss, std::vector < ASCIIdataWriter*> dw_calc);
+void writeFunction(LttRealtime::MeasMatrix data, binaryDataWriter *dw);
+void serverFunction(Eigen::MatrixXcd data);
+//// testing methods
+//void generate_test();
+//void mini_test();
+//void IIR_test();
+//void Gauss_test();
+//void getEsc();
+//Eigen::VectorXd test_cos(Eigen::VectorXd time, double ampl, double freq, double phase, int data_per_block);
+//Eigen::VectorXd test_sin(Eigen::VectorXd time, double ampl, double freq, double phase, int data_per_block);
+//Eigen::VectorXd test_time(double abtast, int data_per_block);
+//void minimalTest();
+std::string get_demodulator(std::string demoFileName);
+std::string fileNameCounter(std::string &_fileName);
+
+int _tmain(int argc, _TCHAR* argv[])
+{
+	int highlight = 1;
+	global.init();
+
+	// initialize screen
+	initscr();
+	init_Screen(stdscr);
+
+	// print controls for the user and highlight number 1
+	Highlight_Choices(stdscr, highlight);
+
+	// prepare timer
+	boost::thread interface_Thread(&update_Interface, stdscr);
+	// prepare measurment
+	boost::thread measurement_Thread(&measurement);
+
+	// wait for user input
+	read_Input(highlight);
+
+	interface_Thread.join();
+	measurement_Thread.join();
+
+	// close window 
+	endwin();
+
+	return 0;
+}
+
+// evaluate user input
+void read_Input(int &highlight)
+{
+	int c = 0;
+	int choice = 0;
+
+	while(global.get_end() == false)
+	{	
+		// reset choice
+		choice = 0;
+
+		// get next pressed key
+		c = getch();
+
+		// evaluate pressed key
+		switch(c)
+		{	
+			// back-tab key pressd
+			case 351:
+			case KEY_LEFT:
+			case KEY_UP:
+				// reached start?
+				if(highlight == 1)
+					// go to end
+					highlight = n_choices;
+				else
+					// previous choice
+					highlight--;
+				break;
+
+			// tab key pressed
+			case 9:
+			case KEY_RIGHT:
+			case KEY_DOWN:
+				// reached end?
+				if(highlight == n_choices)
+					// start from top
+					highlight = 1;
+				else 
+					// next choice
+					highlight++;
+				break;
+
+			// enter pressed
+			case 10:
+				// save chosen option
+				choice = highlight;
+				default_screen_elements(stdscr);
+				break;
+
+			default:
+				// do nothing on any other keys
+				break;
+		}
+		
+		switch(choice)
+		{
+			// start is pressed
+			case 1:
+				// start Timer
+				global.set_run_measurement(true);		
+				break;
+
+			// stop is pressed
+			case 2:
+				global.set_run_measurement(false);
+				break;
+
+			// clear clipping is pressed
+			case 3:
+				reset_Clipping(stdscr);
+				break;
+
+			case 4:
+				// stop loop if programm is closed
+				global.set_end(true);
+				break; 
+
+			// enter editing mode for selection 'measurement name' or 'comment'
+			case 5:
+			case 6:
+				changeText(stdscr, choice);
+				break;
+
+
+			default:
+				// do nothing for undefined selection
+				break;
+		}
+
+		// print choices again including highlighting
+		Highlight_Choices(stdscr, highlight);
+	}	
+
+	return;
+}
+
+// initialize default screen elements
+void init_Screen(WINDOW *menu_win)
+{
+	// clear screen
+	clear();
+	// active function keys from the keyboard (arrows, F1-F12, ...)
+	keypad(stdscr, TRUE);
+
+	// show default screen elements
+	default_screen_elements(menu_win);
+
+	// Verzögerung
+	mvprintw(2, 20, "00:00:000 ms");
+	//mvprintw(4, 1, "Erregerfrequenzen:");
+	for (int i = 1; i <= 8; i++)
+	{
+		// first colum of reference frequencies
+		mvprintw(5+i, 11, "   ---");
+
+		// second column of reference frequencies
+		mvprintw(5+i, 31, "   ---");
+	}
+
+	for (int i = 0; i <= 15; i++)
+	{
+		// default channel setting
+		mvprintw(0+i, 52, "  ---");
+		// default clipping
+		mvprintw(0+i, 58, " ");
+	}
+
+	std::string dateStr = dateWithLeadingZeros();
+	// set measurement name to current date
+  strcpy_s(choices[4], string_limit, dateStr.c_str());
+	global.set_measurementName(dateStr);
+
+	// refresh screen information
+	refresh();
+
+	return;
+}
+
+// gets date with leading zeros
+std::string dateWithLeadingZeros()
+{
+	std::string dateStr = "";
+	int year, month, day;
+
+	// get year, month and day from current clock
+	year = boost::posix_time::second_clock::local_time().date().year();
+	month = boost::posix_time::second_clock::local_time().date().month().as_number();
+	day = boost::posix_time::second_clock::local_time().date().day().as_number();
+
+	// add leading zeros if necessary
+	// CAUTION: program will only function correctly until the year 9.999!
+	dateStr += addLeadingZeros(year, 4);
+	dateStr += addLeadingZeros(month, 2);
+	dateStr += addLeadingZeros(day, 2);
+
+	return dateStr;
+}
+
+// adds leading zeros and converts value to string
+std::string addLeadingZeros(int value, int maxNumberOfDigits)
+{
+	std::string valueStr = "";
+
+	// add leading zeros
+	for (int i = 0; i < maxNumberOfDigits; i++)
+	{
+		if ( value < pow(10.0, i) )
+		{ valueStr += "0"; }
+	}
+
+	// copy values into string
+	valueStr += boost::lexical_cast<std::string>( value );
+
+	return valueStr;
+}
+
+// reset standard screen elements
+void default_screen_elements(WINDOW *menu_win)
+{
+	// print string on screen at position (x, y, string)
+	mvprintw(0, 1, "Verstrichene Zeit:");
+	mvprintw(2, 1, "Verzoegerung:");
+	mvprintw(4, 1, "Erregerfrequenzen:");
+	for (int i = 1; i <= 8; i++)
+	{
+		// first colum
+		mvprintw(5+i, 4, ("Ref " + boost::lexical_cast<std::string>(i) + std::string(":")).c_str());
+
+		// second column
+		mvprintw(5+i, 23, ("Ref " + boost::lexical_cast<std::string>(8 + i) + std::string(":")).c_str());
+	}
+	mvprintw(19, 1, "Messung:");
+	mvprintw(20, 1, "Kommentar:");
+
+	for (int i = 0; i <= 15; i++)
+	{
+		mvprintw(0+i, 45, ("Ch " + boost::lexical_cast<std::string>(i+1) + std::string(":")).c_str());
+	}
+
+	mvprintw(22, 1, "Status:");
+
+	refresh();
+
+	return;
+}
+
+// refresh window and highlight the current choice
+void Highlight_Choices(WINDOW *menu_win, int highlight)
+{
+	for(int i = 0; i < n_choices; ++i)
+	{	
+		// current choice selected?
+		if(highlight == i + 1) 
+		{	
+			// highlight current choice
+			wattron(menu_win, A_REVERSE); 
+			mvwprintw(menu_win, y_choices[i], x_choices[i], "%s", choices[i]);
+			wattroff(menu_win, A_REVERSE);
+		}
+		// else just reprint it
+		else { mvwprintw(menu_win, y_choices[i], x_choices[i], "%s", choices[i]); }
+		// clear line from cursor position until the end
+		clrtoeol();
+	}
+	// refresh window
+	refresh();
+}
+
+// 
+void refresh_Choices(WINDOW *menu_win)
+{
+	for(int i = 0; i < n_choices; ++i)
+	{	
+		// reprint it
+		mvwprintw(menu_win, y_choices[i], x_choices[i], "%s", choices[i]);
+		// clear line from cursor position until the end
+		clrtoeol();
+	}
+
+	return;
+}
+
+// changes the text at the position of choice
+void changeText(WINDOW *menu_win, int choice)
+{
+	// cursor position variables
+	int y = y_choices[choice - 1];
+	int x = x_choices[choice - 1];
+	
+	// auxiliary variables
+	int pos_string = 0;
+	int win_width = 79;
+	std::string str = choices[choice - 1];
+	std::string s;
+
+	// set cursor position to end of string
+	x += str.size();
+	// adjust x and y if x is greater than window width
+	if (x > win_width) 
+	{ 
+		x -= win_width + 1;
+		y++;
+	}
+	
+	// move cursor to current position
+	move(y, x);
+
+	int c = -1;
+	// while enter is not pressed
+	while (c != 10)
+	{
+		pos_string = x - 12;
+		// string position if second line is active
+		if (y == y_choices[choice - 1] + 1) 
+		{ pos_string += win_width + 1; }
+		
+		// fetch character
+		c = getch();
+
+		if ( (c > 31) && (c < 155) )
+		{
+			if (str.size() < string_limit)
+			{
+				// convert ascii value to char
+				s = char(c);
+				// write character into string if not enter
+				str.insert(pos_string, s);
+
+				if (x == win_width)
+				{
+					x = 0;
+					y++;
+				}
+				else
+				{
+					// set new cursor position behind the entered symbol
+					x++;
+				}
+
+				// refresh window with new string
+				mvwprintw(menu_win, y_choices[choice - 1], x_choices[choice - 1], "%s", str.c_str());
+			}
+			else
+			{
+				// refresh window with old string
+				mvwprintw(menu_win, y_choices[choice - 1], x_choices[choice - 1], "%s", str.c_str());
+				// clear rest of line
+				clrtoeol();
+			}
+		}
+		else
+		{
+			switch (c) 
+			{
+				// delete key
+				case KEY_DC:
+					if ( (str.size() > 0) && (pos_string >= 0) )
+					{
+						// erase this character
+						str.erase(pos_string, 1);
+						//// refresh window with new string
+						mvwprintw(menu_win, y_choices[choice - 1], x_choices[choice - 1], "%s", str.c_str());
+						// clear rest of line
+						clrtoeol();
+					}
+					break;
+				// backspace key
+				case 8:
+					if ( (str.size() > 0) && (pos_string >= 1) )
+					{
+						// erase previous character
+						str.erase(pos_string - 1, 1);
+						//// refresh window with new string
+						mvwprintw(menu_win, y_choices[choice - 1], x_choices[choice - 1], "%s", str.c_str());
+						// clear rest of line
+						clrtoeol();
+					}
+					// do NOT enter a break here!
+					// cursor needs to be repositioned as if KEY_LEFT was pressed
+
+				case KEY_LEFT:
+					if ( (x == 0) && (y == ( y_choices[choice - 1] + 1)) )
+					{
+						// previous line, at the end
+						x = win_width;
+						y--;
+					}
+					else if ( (x > x_choices[choice - 1]) || (y == (y_choices[ choice - 1 ] + 1)) )
+					{
+						// move cursor to the left
+						x--;
+					}
+					break;
+
+				case KEY_RIGHT:
+					if ( (str.size() == x - 12) || (str.size() == x - 12 + (win_width + 1)) )
+					{
+						// do nothing if at the end of string
+					}
+					else if (x < win_width)
+					{
+						// move cursor to the right
+						x++;
+					}
+					else if ( (x == win_width) && (y == (y_choices[choice - 1])) )
+					{
+						// next line, from the beginning
+						x = 0;
+						y++;
+					}
+					break;
+
+				// enter key
+				case 10:
+					// do nothing
+					// loop ends automatically
+					break;
+
+				default:
+					// reprint string to avoid overrides because of getch()
+					mvwprintw(menu_win, y_choices[choice - 1], x_choices[choice - 1], "%s", str.c_str());
+					// clear rest of line
+					clrtoeol();
+					// prevents errors
+					break;
+			}
+		}
+		// move cursor to selected position
+		move(y, x);
+		// refresh window 
+		refresh();
+	}
+
+	// get only valid measurement file names
+	if ( (choice == 5) && 
+		( ( str.find("\\")!= std::string::npos ) ||
+		  ( str.find("/") != std::string::npos ) ||
+		  ( str.find(":") != std::string::npos ) ||
+		  ( str.find("*") != std::string::npos ) ||
+		  ( str.find("?") != std::string::npos ) ||
+		  ( str.find("\"")!= std::string::npos ) ||
+		  ( str.find("<") != std::string::npos ) ||
+		  ( str.find(">") != std::string::npos ) ||
+		  ( str.find("|") != std::string::npos ) ))
+	{
+		// get next data block
+		update_Status("Invalid Measurement Name!");
+	}
+	// save measurement name only if changes were made
+	else if ( (choice == 5) && ( strcmp(choices[choice - 1], str.c_str()) != 0 ) )
+	{ 
+		global.set_measurementName(str); 
+	}
+
+
+	// save string as choice
+	strcpy_s(choices[choice - 1], string_limit, str.c_str());
+
+	// save comments to file
+	if ( (choice == 6) && (choices[choice - 1] != "[Default Text]") ) 
+	{ 
+		std::string asciiDataFolder = global.get_asciiDataFolder();
+		// get file path for comments
+		if (asciiDataFolder == "") 
+		{ 
+			//asciiDataFolder = global.get_pathFileName(); 
+			//asciiDataFolder = asciiDataFolder.insert(global.setasciiDataFolder.find_last_of("\\") + 1, global.get_binaryDataFolder());
+		}
+		if (asciiDataFolder.find("comments") == std::string::npos)
+		{ 
+			asciiDataFolder.erase(asciiDataFolder.find_last_of("."), 4);
+			asciiDataFolder.append("_comments.txt"); 
+		}
+		global.set_asciiDataFolder(asciiDataFolder);
+
+		// get current time as string
+		std::string currentTime = boost::lexical_cast<std::string>(boost::posix_time::second_clock::local_time()).c_str();
+
+		// write comment with current time stamp to comment file
+		textWriter tw(asciiDataFolder);
+		std::string tmpS = choices[choice - 1];
+		tw.writeCommentToFile(tmpS, currentTime);
+		tw.close();
+	}
+
+	return;
+}
+
+// update the timer and status while measuring
+void update_Interface(WINDOW *menu_win)
+{
+	int x, y;
+
+	// variables for time tracking
+	boost::posix_time::ptime startTime, currentTime;
+	boost::posix_time::time_duration timeDiff;
+
+	while (global.get_end() == false)
+	{
+		// wait until measurement has started
+		while ( (global.get_run_measurement() == false) && (global.get_end() == false) )
+		{
+			boost::this_thread::sleep(boost::posix_time::milliseconds(500));
+			// keep updating status, important for error display
+			update_Status(menu_win);
+		}
+
+		// save starting time
+		startTime = boost::posix_time::second_clock::local_time();
+
+		while ( (global.get_run_measurement() == true) && (global.get_end() == false) )
+		{
+			// wait a bit
+			boost::this_thread::sleep(boost::posix_time::milliseconds(200));
+
+			if ( !(startTime.is_not_a_date_time()) )
+			{
+				// get end time
+				currentTime = boost::posix_time::second_clock::local_time();
+				// calculate time difference
+				timeDiff = currentTime - startTime;
+				
+				// Check if maximum time exceeded or infinit ru
+				global.check_run_measurement(timeDiff);
+
+				// temporary save cursor position
+				getyx(curscr, y, x);
+
+				// update time on screen
+				mvprintw(0, 20, (boost::lexical_cast<std::string>(timeDiff).c_str()) );
+								
+				// reset cursor to old position
+				move(y, x);
+			}
+			
+			// update status
+			update_Status(menu_win);
+			
+			refresh();
+		}
+	}
+
+	return;
+}
+
+void update_Status(const std::string msg, const bool refreshWindow)
+{
+	boost::mutex::scoped_lock lock(io_mutex);
+	global.set_status(msg);
+	lock.unlock();
+	if (refreshWindow)
+		refresh();
+}
+
+// update status
+void update_Status(WINDOW *menu_win)
+{
+	// update only if not empty
+	if (global.get_status() != "")
+	{ 
+		// lock global variables
+		mvprintw(22, 10, global.get_status().c_str()); 
+		clrtobot();
+		update_Status("",true);
+		//boost::mutex::scoped_lock lock(io_mutex);
+		//global.set_status("");
+		//lock.unlock();
+		
+		// refresh window
+		//refresh();
+	}
+	
+	return;
+}
+
+// updates reference frequencies
+void update_fRef(WINDOW *menu_win, std::vector<int> channelID, std::vector<bool> isRef, Eigen::VectorXd fRefs)
+{
+	int x, y, x_pos, y_pos;
+
+	// temporary save cursor position
+	getyx(curscr, y, x);
+
+	std::string refString = "";
+	int refCounter = 0;
+
+	// go through each channel
+	for (size_t i = 0; i < isRef.size(); i++)
+	{
+		// reset x positions
+		x_pos = 11;
+
+		// print frequency if reference channel
+		if (isRef[i] == true)
+		{
+			refString = std::to_string(static_cast<long long> (fRefs(refCounter)) );
+			refString += std::string(" Hz");
+
+			if ( (fRefs(refCounter) >= 0) && (fRefs(refCounter) < 10) )
+			{ refString = std::string("  ") + refString; }
+			else if ( (fRefs(refCounter) >= 10) && (fRefs(refCounter) < 100) )
+			{ refString = std::string(" ") + refString; }
+			
+			refCounter++;
+
+			y_pos = channelID[i];
+
+			// get second column coordinates
+			if (channelID[i] > 7) 
+			{
+				x_pos = 31;
+				y_pos -= 8;
+			}
+
+			// print to window
+			mvprintw(6 + y_pos, x_pos, refString.c_str());
+		}
+	}
+
+	move(y, x);
+
+	refresh();
+
+	return;
+}
+
+// resets reference frequencies
+void reset_fRef(WINDOW *menu_win)
+{
+	int x, y;
+
+	// temporary save cursor position
+	getyx(curscr, y, x);
+
+	for (int i = 1; i <= 8; i++)
+	{
+		// first colum
+		mvprintw(5+i, 11, "   ---");
+
+		// second column
+		mvprintw(5+i, 31, "   ---");
+	}
+
+	move(y, x);
+	refresh();
+
+	return;
+}
+
+// resets clipping information
+void reset_Clipping(WINDOW *menu_win)
+{
+	int x, y;
+
+	// temporary save cursor position
+	getyx(curscr, y, x);
+
+	for (int i = 0; i <= 15; i++)
+		{ mvprintw(0+i, 58, " "); }
+
+	move(y, x);
+
+	refresh();
+
+	return;
+}
+
+// checks for clipping
+void check_Clipping(WINDOW *menu_win, std::vector<int> channelID, LttRealtime::MeasMatrix &data, std::vector<int> maxAmplRange)
+{
+	int x, y;
+	
+	double maxVal = 0;
+	int percentage = 0;
+	std::string percentage_str = "";
+
+	// temporary save cursor position
+	getyx(curscr, y, x);
+
+	// compare values for each column that contains a sensor signal
+	// not column 0 since this contains the time
+	for (int i = 1; i < data.cols(); i++)
+	{
+		// reset string
+		percentage_str = "";
+
+		// get maximum absolute value
+		//maxVal = std::max(std::abs(data.col(i).maxCoeff()), std::abs(data.col(i).minCoeff()));
+		
+		// calculates percentage
+		// + 0.5 for rounding to nearest int
+		// * 1000 to convert maxAmplRange from mV to V
+		// * 100 to get percentage
+		percentage = static_cast<int> ( 100 * (1000 * maxVal / maxAmplRange[i-1]) + 0.5 );
+
+		// format text to look good
+		if ( (percentage >= 0) && (percentage < 10) ) { percentage_str = "  "; }
+		else if ( (percentage >= 10) && (percentage < 100) ) { percentage_str = " "; }
+
+		percentage_str += std::to_string(static_cast<long long> (percentage)) + std::string (" %%");
+
+		mvprintw(channelID[i-1], 52, percentage_str.c_str());
+
+		if (percentage == 100)
+			{ mvprintw(channelID[i-1], 58, "Clipping"); }
+	}
+
+	move(y, x);
+	refresh();
+
+	return;
+}
+
+// read method of demodulation from configuration file
+std::string get_demodulator(std::string demoFileName)
+{
+	// set keys
+	std::vector<std::string> keys;
+	keys.push_back("demo");
+
+	// read method of demodulation
+	keys = Config::readConfig(demoFileName, keys);
+
+	return keys[0];
+}
+
+// start measurement
+void measurement()
+{
+	// error variables
+	std::string errorMsg;
+	bool connectionError = false;
+		
+	// get directory path of executeable
+	std::string exePath = boost::lexical_cast<std::string> (boost::filesystem::current_path());
+	exePath = exePath.substr(1, exePath.size() - 2) + std::string("\\");
+
+	global.set_exePath(exePath);
+	// and file Name if comments are added before measurement start
+	//global.set_pathFileName(global.get_exePath() + std::string(choices[4]) + global.get_binaryFileExtension());
+
+	// file names of configuration files
+	std::string deviceConfigFileName = exePath + std::string("Config\\Config_LTT_General.ini");
+	std::string channelConfigFileName = exePath + std::string("Config\\Config_LTT_Channel.ini");
+	std::string demoConfigFileName = exePath + std::string("Config\\Config_Demodulation.ini");
+	std::string filterConfigFileName = exePath + std::string("Config\\Config_Filter.ini");
+	std::string gaussConfigFileName = exePath + std::string("Config\\Config_Gauss.ini");
+
+	boost::posix_time::time_duration timeDiff;
+
+	// multithreading of demodulation
+	boost::thread_group demoThreads;
+	// server threads
+	boost::thread_group serverThreads;
+		
+	while (global.get_end() == false)
+	{
+		// flag for calculation of fRefs
+		bool firstRun = true;
+		//, firstBlock = true;
+
+		// create device
+		LTT24 ltt;
+		// sampling frequency of the data
+		int f_sample = 0;
+		// data storing variables
+
+		// before it was an Eigen:: MatrixXd, with default ColMajor
+		LttRealtime::MeasMatrix signalData, refData,dataViewBuffer, dataDemodBuffer,dataBlock;
+
+		Eigen::VectorXd time;
+
+
+		// amount of transferred data
+		int blockSize = 0;
+		int totalViewData = 0;  // Zeigt auf den nächste freie row in dataViewBuffer
+		int totalDemodData = 0;
+		// reference variables
+		std::vector<bool> isRef;
+		Eigen::VectorXd fRefs;
+		Eigen::VectorXd fDominant;
+		int nChannels = 0, nRefs = 0;
+		int dataPerPeriod = 0;
+	
+		// prepare filter
+		std::vector<Filter> filters;
+		Gaussian gauss;
+		std::vector<Gaussian> gaussVector;
+
+		// prepare demodulators
+		Qdt qdt;
+		LombScargle LS;
+		SineFit SF;
+
+		// prepare server
+		Server dataServer;
+
+		// file names of data storing files
+		std::string binaryFullFileName;
+		
+		try
+		{
+			// reset reference frequencies
+			reset_fRef(stdscr);
+
+			if (connectionError)
+			{
+				// wait until measurement has started
+				while ( (global.get_run_measurement() == false) && (global.get_end() == false) )
+				 { boost::this_thread::sleep(boost::posix_time::milliseconds(100)); }
+			}
+			else
+			{
+				// initialize everything
+				ltt.init(deviceConfigFileName, channelConfigFileName);
+				// start measurement, status not needed
+				ltt.startMeasurement();
+
+				// show data while idle
+				while ( (global.get_run_measurement() == false) && (global.get_end() == false) )
+				{					
+					// get next data block
+					ltt.getDataBlock(dataBlock, blockSize);
+					
+					check_Clipping(stdscr, ltt.getID(), dataBlock, ltt.getRange());
+				}
+
+				// stop measurement before real measurement starts
+				ltt.stopMeasurement();
+			}
+
+			// end function if program should be exited
+			if (global.get_end() == true) { return; }
+
+			// initialize everything
+			ltt.init(deviceConfigFileName, channelConfigFileName);
+			// reset connection error for new config
+			connectionError = false;
+
+			// get sampling frequency
+			f_sample = ltt.getFSample();
+			// get number of references
+			isRef = ltt.getRefs();
+			nChannels = isRef.size();
+			fDominant.resize(nChannels);
+			// get number of references from isRef
+			for (size_t i = 0; i < isRef.size(); i++)
+				{ if (isRef[i] == true) { nRefs++; } }
+
+			// get demodulator
+			global.set_demo_str(get_demodulator(demoConfigFileName));
+			// read filters
+			filters = Filter::getFilter(filterConfigFileName);
+			gauss.setDegree(Gaussian::getGauss(gaussConfigFileName));
+
+			// check if gauss filter is valid and existing
+			bool existingGauss = gauss.existing();
+			if (existingGauss)
+			{
+				// create multiple copies of gauss in a vector
+				// as each value needs an own gauss filter
+				// * 2 because each demodulated value consists of real and imag part
+				for (int i = 0; i < (2 * nChannels * nRefs); i++)
+				{ gaussVector.push_back(gauss); }
+			}
+
+			// resize data buffer
+			dataViewBuffer.resize(f_sample, nChannels + 1); // Shiftbuffer for visualisation  
+			dataDemodBuffer.resize(2 * f_sample, nChannels + 1); // Shifbuffer for demodulation
+
+			// start measurement with device
+			update_Status(ltt.startMeasurement());
+				
+			// set name according to input
+			binaryFullFileName =  global.get_binaryDataFolder()+"\\"+global.get_measurementName() +"." +global.get_binaryFileExtension();
+
+			// change counter of fileName to avoid overwriting
+			std::string currentMeasurementName = fileNameCounter(binaryFullFileName);
+
+			// prepare writer
+			binaryDataWriter dw(binaryFullFileName);
+
+			// set measurement name in the interface
+			strcpy_s(choices[4], string_limit,currentMeasurementName.c_str());
+			refresh_Choices(stdscr);
+
+			// save for comment saving location
+			//global.set_asciiDataFolder(data_FileName);
+			//global.set_gnuplotDataFolder(data_FileName);
+
+			// new writer for each reference channel
+			std::vector<ASCIIdataWriter*> calcWriters;
+			for (size_t RefNo = 0; RefNo < calcWriters.size(); RefNo++)
+			{
+				// adds reference extension to data file name
+				std::string refExtension = "_calc_Ref" + std::to_string(static_cast<long long> (RefNo + 1));
+				std::string calcFileName = binaryFullFileName;
+				calcFileName.insert(calcFileName.find_last_of("."), refExtension);
+				calcWriters.push_back( &ASCIIdataWriter(calcFileName, false) );
+			}
+
+
+  		// keep measuring until user stop
+			while ((global.get_run_measurement() == true) && (global.get_end() == false))
+			{
+				// get next data block
+				ltt.getDataBlock(dataBlock, blockSize);
+				boost::posix_time::ptime t1 = boost::posix_time::microsec_clock::local_time();
+
+				// get starting time of demodulation
+				boost::posix_time::ptime startTime = boost::posix_time::microsec_clock::local_time();
+
+				// first data block always containes incorrect data
+				//if (firstBlock)
+				//{
+				//	firstBlock = false;
+				//	continue;
+				//}
+
+				// write raw data to file as soon as possible
+				// new thread to minimize time consumption
+				// it takes round about 1s at TG Computer in Debuging Mode
+				t1 = boost::posix_time::microsec_clock::local_time();
+				boost::thread writeThread(&writeFunction, dataBlock, &dw);
+				//writeFunction(dataBlock, &dw);
+				//t1 = boost::posix_time::microsec_clock::local_time();
+
+				// is data inside selected range?
+				check_Clipping(stdscr, ltt.getID(), dataBlock, ltt.getRange());
+
+				//dataViewBuffer leads to overflow with new data. 
+				if (totalViewData + blockSize > f_sample)
+				{
+					// copy rest of data to beginning of matrix and set totalViewData that new data fill complete dataViewBuffer
+					int di = totalViewData - (f_sample - blockSize);
+					int in = totalViewData;
+					if (totalViewData > f_sample - blockSize)
+						in = f_sample - blockSize;
+					for (int j = 0; j < nChannels+1; j++) // nChannels+1 incl Zeitspalte
+					{
+						for (int i = 0; i < in; i++)
+						{
+							dataViewBuffer(i,j) = dataViewBuffer(i + di,j);
+						}
+					}
+					totalViewData = f_sample - blockSize;
+				}
+
+				// save all data in temporary matrix for the last Second definded indirect via f_sample
+				for (int j = 0; j < nChannels+1; j++) // nChannels+1 incl. Zeitspalte
+				{
+					for (int i = totalViewData; i < (totalViewData + blockSize); i++)
+					{
+						dataViewBuffer(i,j) = dataBlock(i - totalViewData,j);
+					}
+				}
+				// get total amount of collected data
+				totalViewData += blockSize;
+
+				// get frequencies with minimum of 1 second of data
+				if (totalViewData >= f_sample)
+				{
+					// get dominante frequencies from FFT for all used channels
+					for (int i = 0; i < nChannels; i++)
+					{
+						fDominant(i) = Demodulator::FFTDominant(dataViewBuffer.col(i+1), f_sample);  // i+1 wegen Zeitspalte
+					}
+
+					// display calculated frequencies
+					std::vector<bool> useDominant(nChannels);
+					for (int j = 0; j < nChannels; j++)
+						useDominant[j] = true;
+					update_fRef(stdscr, ltt.getID(), useDominant, fDominant);
+
+					// get reference frequencies on first run with minimum of 1 second of data
+					if (firstRun == true)
+					{
+						// not first run anymore
+						firstRun = false;
+
+						// resize fRefs to fit all reference frequencies
+						fRefs.resize(nRefs);
+
+						// get reference data for FFT
+						refData.resize(f_sample, nRefs);
+						// counter for matrix sizes
+						int refCounter = 0;
+						// loop through matrix except time col
+						// in order to split data and reference data
+						for (int i = 1; i < dataViewBuffer.cols(); i++)
+						{
+							// sort into reference and data channels
+							if (isRef[i - 1] == true)
+							{
+								refData.col(refCounter) = dataViewBuffer.col(i).block(0, 0, f_sample, 1);
+								refCounter++;
+							}
+						}
+
+						// get reference frequencies from FFT
+						for (int i = 0; i < nRefs; i++)
+						{
+							fRefs(i) = Demodulator::FFTDominant(refData.col(i), f_sample);
+						}
+
+						// display reference frequencies
+						update_fRef(stdscr, ltt.getID(), isRef, fRefs);
+
+						// get number of data points that make up a period
+						dataPerPeriod = static_cast<int> (f_sample / ToolBox::greatestCommonDivisor(fRefs));
+
+						// dataBuffer acts as a buffer until enough data for demodulation is collected
+						// for this, dataBuffer needs to have a size of at least dataPerPeriod + blockSize
+						// 2 * blockSize is added for extra buffer space
+						signalData.resize(dataPerPeriod, nChannels - nRefs);
+						refData.setZero();
+						refData.resize(dataPerPeriod, nRefs);
+						time.resize(dataPerPeriod);
+						demoResult.resize(nRefs, nChannels - nRefs);
+					}
+				}
+				
+				// save all data in temporary matrix for demodulation
+				for (int i = totalDemodData; i < (totalDemodData + blockSize); i++)
+				{
+					dataDemodBuffer.row(i) = dataBlock.row(i - totalDemodData);
+				}
+
+				// get total amount of collected data
+				totalDemodData += blockSize;
+
+				while ( (totalDemodData >= dataPerPeriod) && (firstRun == false) )
+				{ 
+					// fill time vector
+					time = dataDemodBuffer.block(0, 0, dataPerPeriod, 1);
+
+					// counter for matrix sizes
+					int refCounter = 0, dataCounter = 0;
+					// loop through matrix except time col
+					// in order to split data and reference data
+					for (int i = 1; i < dataDemodBuffer.cols(); i++)
+					{ 
+						// sort into reference and data channels
+						if (isRef[i - 1] == true)
+						{
+							refData.col(refCounter) = dataDemodBuffer.block(0, i, dataPerPeriod, 1);
+							refCounter++;
+						}
+						else
+						{
+							signalData.col(dataCounter) = dataDemodBuffer.block(0, i, dataPerPeriod, 1);
+							dataCounter++;
+						}
+					}
+	
+					// use all filters on signal data
+					for (int i = 0; i < signalData.cols(); i++)
+					{
+						for (size_t j = 0; j < filters.size(); j++)
+						{
+							signalData.col(i) = filters[j].use(signalData.col(i));
+						}
+					}
+
+					// demodulate each signal in extra thread
+		
+					for (int i = 0; i < refData.cols(); i++)
+					{
+						// each result value of each signal depending on each reference needs an own gaussian filter
+						std::vector<Gaussian> correspondingGauss;
+						if (existingGauss)
+						{
+							for (int j = 0; j < (2 * nChannels); j++)
+							{ correspondingGauss.push_back(gaussVector[i*(2 * nChannels) + j]); }
+						}
+
+						demoThreads.add_thread(new boost::thread( &evaluateSignals, time, refData.col(i), signalData,
+							ltt, i, fRefs, correspondingGauss, calcWriters));
+					}
+										
+					// subtract evaluated data
+					totalDemodData -= dataPerPeriod;
+
+					// copy rest of data to beginning of matrix
+					for (int i = 0; i < totalDemodData; i++)
+					{ dataDemodBuffer.row(i) = dataDemodBuffer.row(i + dataPerPeriod); }
+
+					// wait for execution of previous demodulation threads before starting next loop
+					demoThreads.join_all();
+
+					// finish responding before new server is opened, ??
+					serverThreads.join_all();
+					//// new server in new thread
+					//serverThreads.add_thread(new boost::thread( &serverFunction, demoResult ));
+				}
+				// get end time of demodulation
+				boost::posix_time::ptime endTime = boost::posix_time::microsec_clock::local_time();
+
+				// wait for writing to finish
+				writeThread.join();
+				boost::posix_time::ptime t2 = boost::posix_time::microsec_clock::local_time();
+				boost::posix_time::time_duration difTime = t2 - t1;
+				std::string buf;
+				buf = boost::posix_time::to_simple_string(difTime);
+				update_Status(buf, true);
+				//boost::this_thread::sleep(boost::posix_time::milliseconds(1));
+			}  // End of measurement loop
+			
+			// finish thread execution after measurement stop
+			serverThreads.join_all();
+
+			// close all writers
+			dw.close();
+			for (size_t i = 0; i < calcWriters.size(); i++)
+			{ calcWriters[i]->close(); }
+
+			// stop measurement and deinitialize device
+			ltt.stopMeasurement();
+		}
+		// catch exceptions that have been thrown manually
+		catch (const std::string ex)
+		{
+			connectionError = true;
+			errorMsg = ex;
+		}
+		// catch usual exceptions and print them
+		catch (const std::exception &ex)
+		{
+			errorMsg = ex.what();
+		}
+		// catch unusual exceptions of the program itself
+		catch (...)
+		{
+			errorMsg = "Unexpected error occured!";
+		}
+
+		if (errorMsg != "") 
+		{ 
+			update_Status(errorMsg);
+			// reset error message
+			errorMsg = "";
+		}
+
+		// set running flag to false, in case it was stopped due to errors
+		global.set_run_measurement(false);
+	}
+
+	return;
+}
+
+// add counter to fileName to avoid overwriting data
+std::string fileNameCounter(std::string &_fileName)
+{
+	std::string tmpFileName;
+	// flag to show if file already exists
+	bool fileExists = true;
+	size_t symbol_pos = 0;
+	int counter = 0;
+	std::string counter_str = "";
+
+	// current measurement name
+	std::string fileNameWithCounter = "";
+
+	while (fileExists)
+	{
+		tmpFileName = _fileName;
+
+		// build counter number as string
+		if (counter < 10) { counter_str = "000"; }
+		else if (counter < 100) { counter_str = "00"; }
+		else if (counter < 1000) { counter_str = "0"; }
+		counter_str = std::string("_") + counter_str + std::to_string(static_cast<long long> (counter));
+		counter++;
+
+		// edit counter into file name
+		symbol_pos = tmpFileName.find_last_of(".");
+		tmpFileName.insert(symbol_pos, counter_str);
+
+		// check if file with the same name already exists
+		std::ifstream existFile(tmpFileName); 
+		fileExists = existFile.good();
+	}
+
+	_fileName = tmpFileName;
+
+	std::ofstream testFile(_fileName, std::ios::out | std::ios::app); 
+	// check for valid file path by trial and error
+	if (!testFile.is_open())
+		{ throw ("Invalid writing path!"); }
+
+	// get current file name with counter
+	fileNameWithCounter = _fileName.substr(_fileName.find_last_of("\\") + 1);
+	fileNameWithCounter = fileNameWithCounter.erase(fileNameWithCounter.find_last_of("."));
+
+	return fileNameWithCounter;
+}
+
+// calculates reference frequencies 
+Eigen::VectorXd calcFRef(int nRefs, std::vector<bool> isRef, int f_sample, LttRealtime::MeasMatrix dataBuffer)
+{
+	// resize fRefs to fit all reference frequencies
+	Eigen::VectorXd fRefs(nRefs);
+
+	// get reference data for FFT
+	LttRealtime::MeasMatrix refData(f_sample, nRefs);
+	// counter for matrix sizes
+	int refCounter = 0;
+	// loop through matrix except time col
+	// in order to split data and reference data
+	for (int i = 1; i < dataBuffer.cols(); i++)
+	{ 
+		// sort into reference and data channels
+		if (isRef[i - 1] == true)
+		{
+			refData.col(refCounter) = dataBuffer.col(i).block(0, 0, f_sample, 1);
+			refCounter++;
+		}
+	}
+
+	// get reference frequencies from FFT
+	for (int i = 0; i < nRefs; i++)
+		{ fRefs(i) = Demodulator::FFTDominant(refData.col(i), f_sample); }
+					
+	return fRefs;
+}
+
+// this function will be called in multiple threads
+// to evalute multiple signals at the same time
+void evaluateSignals(Eigen::VectorXd time, LttRealtime::MeasMatrix refData, LttRealtime::MeasMatrix signalData,
+		LTT24 ltt, int RefNo, Eigen::VectorXd fRefs, std::vector<Gaussian> gauss, std::vector < ASCIIdataWriter*> dw_calc)
+{
+	// output matrix
+	Eigen::MatrixXcd calc_Data;
+	// auxiliary matrix
+	LttRealtime::MeasMatrix temp;
+
+	// prepare demodulators
+	Qdt qdt;
+	LombScargle LS;
+	SineFit SF;
+	// which demodulator was chosen
+	std::string demo_str = global.get_demo_str();
+
+	// coil variables
+	LttRealtime::MeasMatrix amplCorr, phaseCorr;
+	std::vector<double> uToB;
+
+	// every thread works with one reference frequency
+	// needs to be a vector for demodulation
+	Eigen::VectorXd fRef(1);
+	fRef(0) = fRefs(RefNo);
+
+	// get correction and conversion factors of coils
+	ltt.getAmplPhaseCorr(fRef, amplCorr, phaseCorr);
+	uToB = ltt.getConversionUtoB();
+	
+	// demodulate data with chosen method
+	if (demo_str == "QDT")
+		{ calc_Data = qdt.extract(time, signalData, refData, fRef, phaseCorr, amplCorr); }
+	else if (demo_str == "LS")
+		{ calc_Data = LS.extract(time, signalData, refData, fRef, phaseCorr, amplCorr); }
+	else if (demo_str == "SF")
+		{ calc_Data = SF.extract(time, signalData, refData, fRef, phaseCorr, amplCorr); }
+	else 
+		{ throw std::string("Invalid demodulation method selected. Please check configuration file!"); }
+	
+	// convert U to B
+	for (int i = 0; i < calc_Data.cols(); i++)
+	{ calc_Data.col(i) /= uToB[i]; }
+
+	// divide by fRef
+	calc_Data /= fRef(0);
+
+	int cols = calc_Data.cols();
+
+	// only try to use gauss filter if gauss filters are given
+	if (gauss.size() > 0)
+	{
+		// use gauss filter on data
+		for (int i = 0; i < calc_Data.rows(); i++)
+		{
+			for (int j = 0; j < calc_Data.cols(); j++)
+			{
+				calc_Data(i, j).real( gauss[2*(j + cols * i)].continousConvolve(calc_Data(i, j).real()) );
+				calc_Data(i, j).imag( gauss[2*(j + cols * i) + 1].continousConvolve(calc_Data(i, j).imag()) );
+			}
+		}
+	}
+
+	// write data to result matrix
+	boost::mutex::scoped_lock lock(io_mutex);
+	demoResult.row(RefNo) = calc_Data.row(0);
+	lock.unlock();
+
+	// write demodulated data to file
+	if (dw_calc.size() > RefNo)
+	  dw_calc[RefNo]->writeComplexDataToFile(time, calc_Data);
+
+	return;
+}
+
+// thread for writing data to a file
+// because writing is the most time consuming task
+void writeFunction(LttRealtime::MeasMatrix data, binaryDataWriter *dw)
+{
+	dw->writeDataToFile(data);
+	return;
+}
+
+// thread to keep server running
+void serverFunction(Eigen::MatrixXcd data)
+{
+	Server::transferComplexData(data);
+	return;
+}
+
